@@ -54,7 +54,7 @@ streamlit run app.py
 - Inventory dashboard with PO units and on-hand totals by SKU (or item description when no SKU is printed)
 - Currency comparisons with a small tolerance for floating-point rounding
 - Excel-ready CSV download with PO fields repeated on each line-item row
-- Friendly extraction errors and a retry path
+- Detailed AI extraction diagnostics with HTTP/provider error codes, request IDs, and schema/JSON failure codes
 - A no-API synthetic sample with three items and an intentional discrepancy
 
 ## What is simulated

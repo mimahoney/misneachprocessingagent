@@ -562,6 +562,44 @@ def extract_po_with_ai(file_bytes: bytes, filename: str, mime_type: str) -> Purc
     return response.output_parsed
 
 
+def format_extraction_error(exc: Exception) -> str:
+    """Expose actionable AI/provider diagnostics without reducing every failure to one message."""
+    exception_name = type(exc).__name__
+    status_code = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    api_code = getattr(exc, "code", None)
+    api_type = getattr(exc, "type", None)
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error_body = body.get("error", body)
+        if isinstance(error_body, dict):
+            api_code = api_code or error_body.get("code")
+            api_type = api_type or error_body.get("type")
+
+    if isinstance(exc, ValidationError):
+        display_code = "AI-SCHEMA-VALIDATION"
+    elif isinstance(exc, json.JSONDecodeError):
+        display_code = "AI-INVALID-JSON"
+    elif status_code:
+        display_code = f"AI-HTTP-{status_code}"
+    elif isinstance(exc, RuntimeError):
+        display_code = "AI-CONFIGURATION"
+    else:
+        display_code = f"AI-{exception_name.upper()}"
+
+    details = [f"[{display_code}]", str(exc).strip() or exception_name]
+    metadata = []
+    if api_code:
+        metadata.append(f"provider code: {api_code}")
+    if api_type:
+        metadata.append(f"type: {api_type}")
+    if request_id:
+        metadata.append(f"request ID: {request_id}")
+    if metadata:
+        details.append(f"({'; '.join(metadata)})")
+    return " ".join(details)
+
+
 def extract_receipt_with_ai(
     file_bytes: bytes, filename: str, mime_type: str
 ) -> ExpenseReceipt:
@@ -985,12 +1023,10 @@ def render_po_upload_step() -> None:
                              "mime_type": uploaded_file.type},
                 "status": "needs review",
             })
-        except RuntimeError as exc:
-            failures.append(f"{uploaded_file.name}: {exc}")
-        except (ValidationError, json.JSONDecodeError, ValueError):
-            failures.append(f"{uploaded_file.name}: AI response was not valid PO data.")
-        except Exception:
-            failures.append(f"{uploaded_file.name}: extraction failed; please retry.")
+        except Exception as exc:
+            failures.append(
+                f"{uploaded_file.name}: {format_extraction_error(exc)}"
+            )
     progress.empty()
     if failures:
         st.error("Some documents could not be extracted:\n\n- " + "\n- ".join(failures))
