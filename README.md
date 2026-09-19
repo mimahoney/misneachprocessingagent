@@ -38,9 +38,9 @@ streamlit run app.py
 
 ## What works
 
-- Bulk drag-and-drop for PDF, PNG, JPG, and JPEG POs with automated sequential extraction and a per-document review queue
-- Guided upload-to-review wizard that displays only the current stage instead of stacking the uploader and review workspace
-- Duplicate protection that skips identical uploaded files, flags repeated PO numbers, and requires explicit verification before replacing a saved PO
+- Single-PO drag-and-drop for PDF, PNG, JPG, and JPEG documents
+- Guided upload-to-review wizard that displays only the current stage
+- Duplicate protection that checks the extracted PO number against saved records and requires explicit verification before replacement
 - Vision-based PO extraction into a strict, validated schema
 - Side-by-side, in-app preview of the original PDF or image and the editable extracted data
 - Editable PO summary and line-item table
@@ -52,6 +52,7 @@ streamlit run app.py
 - Saved-order history with deletion controls
 - Inventory ledger populated directly from saved PO line-item quantities
 - Inventory dashboard with PO units and on-hand totals by SKU (or item description when no SKU is printed)
+- Dashboard Excel download containing every saved PO and all associated line items on separate formatted worksheets
 - Currency comparisons with a small tolerance for floating-point rounding
 - Excel-ready CSV download with PO fields repeated on each line-item row
 - Detailed AI extraction diagnostics with HTTP/provider error codes, request IDs, and schema/JSON failure codes

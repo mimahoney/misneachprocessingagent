@@ -2,3 +2,4 @@ streamlit[pdf]>=1.64,<2
 openai>=1.60,<3
 pandas>=2.2,<3
 pydantic>=2.10,<3
+xlsxwriter>=3.2,<4

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import html
+import io
 import json
 import os
 import sqlite3
@@ -300,6 +300,106 @@ def load_orders() -> pd.DataFrame:
             """,
             connection,
         )
+
+
+def load_all_po_line_items() -> pd.DataFrame:
+    with get_connection() as connection:
+        return pd.read_sql_query(
+            """
+            SELECT po.po_number, po.buyer, po.order_date, po.ship_by_date,
+                   po.currency, li.sku, li.description, li.quantity,
+                   li.unit_price, li.line_total, po.source_filename, po.created_at
+            FROM purchase_orders po
+            JOIN line_items li ON li.purchase_order_id = po.id
+            ORDER BY po.created_at DESC, po.id DESC, li.id ASC
+            """,
+            connection,
+        )
+
+
+def all_pos_excel_bytes(orders: pd.DataFrame, line_items: pd.DataFrame) -> bytes:
+    """Build a formatted Excel workbook containing every saved PO and line item."""
+    import xlsxwriter
+
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    title_format = workbook.add_format({
+        "bold": True, "font_size": 15, "font_color": "#090908",
+    })
+    header_format = workbook.add_format({
+        "bold": True, "font_color": "#090908", "bg_color": "#FFCB28",
+        "border": 1, "border_color": "#090908", "align": "center",
+        "valign": "vcenter",
+    })
+    text_format = workbook.add_format({"font_color": "#090908"})
+    date_format = workbook.add_format({"num_format": "mm/dd/yy"})
+    money_format = workbook.add_format({"num_format": "#,##0.00"})
+    quantity_format = workbook.add_format({"num_format": "#,##0.00"})
+
+    order_columns = [
+        ("PO Number", "po_number", 19, text_format),
+        ("Buyer", "buyer", 28, text_format),
+        ("Order Date", "order_date", 13, date_format),
+        ("Ship By Date", "ship_by_date", 13, date_format),
+        ("Currency", "currency", 10, text_format),
+        ("Subtotal", "subtotal", 14, money_format),
+        ("Shipping", "shipping", 12, money_format),
+        ("Tax", "tax", 12, money_format),
+        ("Other Charges", "other_charges", 14, money_format),
+        ("Discount", "discount", 12, money_format),
+        ("Order Total", "order_total", 14, money_format),
+        ("Line Items", "line_item_count", 11, quantity_format),
+        ("Source File", "source_filename", 34, text_format),
+        ("Added", "created_at", 20, text_format),
+    ]
+    item_columns = [
+        ("PO Number", "po_number", 19, text_format),
+        ("Buyer", "buyer", 28, text_format),
+        ("Order Date", "order_date", 13, date_format),
+        ("Ship By Date", "ship_by_date", 13, date_format),
+        ("Currency", "currency", 10, text_format),
+        ("SKU", "sku", 18, text_format),
+        ("Description", "description", 38, text_format),
+        ("Quantity", "quantity", 12, quantity_format),
+        ("Unit Price", "unit_price", 14, money_format),
+        ("Line Total", "line_total", 14, money_format),
+        ("Source File", "source_filename", 34, text_format),
+        ("Added", "created_at", 20, text_format),
+    ]
+
+    def write_sheet(name: str, title: str, frame: pd.DataFrame, columns: list[tuple]) -> None:
+        sheet = workbook.add_worksheet(name)
+        sheet.hide_gridlines(2)
+        sheet.write(1, 0, title, title_format)
+        sheet.write(2, 0, f"Exported {date.today().strftime('%m/%d/%Y')}", text_format)
+        header_row = 4
+        for column_index, (label, source, width, cell_format) in enumerate(columns):
+            sheet.write(header_row, column_index, label, header_format)
+            sheet.set_column(column_index, column_index, width, cell_format)
+            for row_index, value in enumerate(frame.get(source, pd.Series(dtype=object)), start=header_row + 1):
+                if pd.isna(value):
+                    sheet.write_blank(row_index, column_index, None, cell_format)
+                elif source in {"order_date", "ship_by_date"}:
+                    parsed = pd.to_datetime(value, errors="coerce")
+                    if pd.isna(parsed):
+                        sheet.write(row_index, column_index, str(value), text_format)
+                    else:
+                        sheet.write_datetime(row_index, column_index, parsed.to_pydatetime(), date_format)
+                elif source in {"subtotal", "shipping", "tax", "other_charges", "discount",
+                                "order_total", "quantity", "unit_price", "line_total", "line_item_count"}:
+                    sheet.write_number(row_index, column_index, float(value), cell_format)
+                else:
+                    sheet.write(row_index, column_index, str(value), cell_format)
+        last_row = header_row + max(len(frame), 1)
+        sheet.autofilter(header_row, 0, last_row, len(columns) - 1)
+        sheet.freeze_panes(header_row + 1, 0)
+        sheet.set_row(header_row, 24)
+
+    write_sheet("Purchase Orders", "All saved purchase orders", orders, order_columns)
+    write_sheet("Line Items", "All saved PO line items", line_items, item_columns)
+    workbook.close()
+    output.seek(0)
+    return output.getvalue()
 
 
 def delete_order(order_id: int) -> None:
@@ -928,124 +1028,126 @@ def format_money(value: float, currency: Optional[str]) -> str:
     return f"{symbol}{value:,.2f}{suffix}"
 
 
+def reset_po_workflow() -> None:
+    st.session_state.po_wizard_stage = "upload"
+    for key in (
+        "extracted_po", "line_items", "source_document", "extraction_queue",
+        "active_result_index", "po_uploader", "po_upload_error", "save_message",
+    ):
+        st.session_state.pop(key, None)
+
+
+def process_single_po_upload() -> None:
+    """Extract the selected PO before Streamlit renders the next wizard stage."""
+    uploaded_file = st.session_state.get("po_uploader")
+    use_sample = st.session_state.get("use_synthetic_sample", False)
+    st.session_state.pop("po_upload_error", None)
+    if use_sample:
+        results = [{
+            "po": SYNTHETIC_SAMPLE, "source": "synthetic", "document": None,
+            "status": "needs review",
+        }]
+    elif uploaded_file is None:
+        st.session_state.po_upload_error = (
+            "Upload a PDF or image, or select “Use synthetic sample.”"
+        )
+        return
+    else:
+        try:
+            file_bytes = uploaded_file.getvalue()
+            po = extract_po_with_ai(file_bytes, uploaded_file.name, uploaded_file.type)
+            results = [{
+                "po": po.model_dump(), "source": "ai",
+                "document": {"bytes": file_bytes, "filename": uploaded_file.name,
+                             "mime_type": uploaded_file.type},
+                "status": "needs review",
+            }]
+        except Exception as exc:
+            st.session_state.po_upload_error = (
+                f"{uploaded_file.name}: {format_extraction_error(exc)}"
+            )
+            return
+
+    possible_duplicates = classify_batch_duplicates(results)
+    st.session_state.extraction_queue = results
+    st.session_state.extraction_batch_id = st.session_state.get("extraction_batch_id", 0) + 1
+    activate_queued_result(0)
+    st.session_state.po_wizard_stage = "review"
+    st.session_state.extraction_notice = {
+        "extracted": 1, "uploaded": 1, "possible_duplicates": possible_duplicates,
+        "skipped_files": [], "failures": [],
+    }
+
+
+def save_reviewed_po(
+    summary: dict,
+    edited_items: pd.DataFrame,
+    source_filename: str,
+    replace_existing: bool,
+) -> None:
+    """Save the reviewed PO before rendering the completion stage."""
+    try:
+        save_approved_po(
+            summary,
+            edited_items,
+            source_filename,
+            replace_existing=replace_existing,
+        )
+    except sqlite3.IntegrityError:
+        st.session_state.po_save_error = (
+            "That PO number is already saved. Verify the duplicate or change the PO number."
+        )
+        return
+    st.session_state.save_message = (
+        f"PO {summary['po_number']} was "
+        f"{'verified and replaced' if replace_existing else 'saved'} and inventory was updated."
+    )
+    st.session_state.po_wizard_stage = "complete"
+    for key in (
+        "extracted_po", "line_items", "source_document", "extraction_queue",
+        "active_result_index", "po_save_error",
+    ):
+        st.session_state.pop(key, None)
+
+
 def render_po_upload_step() -> None:
-    """Render only the upload/extraction stage of the PO wizard."""
+    """Render the single-file upload/extraction stage of the PO wizard."""
     st.markdown(
         """
         <div class="section-heading">
-            <span class="eyebrow">STEP 1 · BULK UPLOAD</span>
-            <h2>Add purchase orders</h2>
-            <p>Drop one PO or a batch. Every file is extracted automatically in upload order.</p>
-        </div>
-        <div class="bulk-upload-guide">
-            <div><span>1</span>Drop multiple POs</div>
-            <div><span>2</span>Extract the full batch</div>
-            <div><span>3</span>Review one at a time</div>
+            <span class="eyebrow">STEP 1 · UPLOAD</span>
+            <h2>Add a purchase order</h2>
+            <p>Upload one PO, extract it, review the result, and save it before starting another.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
     workflow_steps(1)
-    uploaded_files = st.file_uploader(
-        "Drag and drop purchase orders here",
+    uploaded_file = st.file_uploader(
+        "Drag and drop one purchase order here",
         type=SUPPORTED_TYPES,
-        accept_multiple_files=True,
-        key="po_bulk_uploader",
-        help="Add multiple PDF, PNG, JPG, or JPEG purchase orders.",
+        accept_multiple_files=False,
+        key="po_uploader",
+        help="Add one PDF, PNG, JPG, or JPEG purchase order.",
     )
-    if uploaded_files:
-        total_bytes = sum(uploaded.size for uploaded in uploaded_files)
+    if uploaded_file:
         st.markdown(
-            f'<div class="queue-bar"><strong>{len(uploaded_files)} PO'
-            f"{'s' if len(uploaded_files) != 1 else ''} ready to process</strong>"
-            f'<span>{total_bytes / (1024 * 1024):.1f} MB total · processed in upload order</span></div>',
+            f'<div class="queue-bar"><strong>{html.escape(uploaded_file.name)}</strong>'
+            f'<span>{uploaded_file.size / (1024 * 1024):.1f} MB · ready to extract</span></div>',
             unsafe_allow_html=True,
         )
-        st.dataframe(
-            pd.DataFrame([
-                {"Queue": index, "File": uploaded.name, "Status": "Waiting"}
-                for index, uploaded in enumerate(uploaded_files, start=1)
-            ]),
-            use_container_width=True,
-            hide_index=True,
-        )
-    use_sample = st.checkbox(
+    st.checkbox(
         "Use synthetic sample",
+        key="use_synthetic_sample",
         help="Loads clearly labeled synthetic data and does not call the AI API.",
     )
-    extract_label = (
-        f"Extract all {len(uploaded_files)} purchase orders"
-        if len(uploaded_files) > 1 else "Extract purchase order"
+    if st.session_state.get("po_upload_error"):
+        st.error(st.session_state.po_upload_error)
+    st.button(
+        "Extract purchase order",
+        type="primary",
+        on_click=process_single_po_upload,
     )
-    if not st.button(extract_label, type="primary"):
-        return
-    if use_sample:
-        sample_results = [{
-            "po": SYNTHETIC_SAMPLE, "source": "synthetic", "document": None,
-            "status": "needs review",
-        }]
-        possible_duplicates = classify_batch_duplicates(sample_results)
-        st.session_state.extraction_queue = sample_results
-        st.session_state.extraction_batch_id = st.session_state.get("extraction_batch_id", 0) + 1
-        activate_queued_result(0)
-        st.session_state.extraction_notice = {
-            "extracted": 1, "uploaded": 1,
-            "possible_duplicates": possible_duplicates,
-            "skipped_files": [], "failures": [],
-        }
-        st.session_state.po_wizard_stage = "review"
-        st.rerun()
-    if not uploaded_files:
-        st.warning("Upload one or more PDFs or images, or select “Use synthetic sample.”")
-        return
-
-    results, failures, duplicate_files = [], [], []
-    seen_file_hashes: dict[str, str] = {}
-    progress = st.progress(0, text="Starting batch extraction…")
-    for position, uploaded_file in enumerate(uploaded_files, start=1):
-        progress.progress(
-            (position - 1) / len(uploaded_files),
-            text=f"Extracting {uploaded_file.name} ({position} of {len(uploaded_files)})…",
-        )
-        try:
-            file_bytes = uploaded_file.getvalue()
-            file_hash = hashlib.sha256(file_bytes).hexdigest()
-            if file_hash in seen_file_hashes:
-                duplicate_files.append(
-                    f"{uploaded_file.name} (same file as {seen_file_hashes[file_hash]})"
-                )
-                continue
-            seen_file_hashes[file_hash] = uploaded_file.name
-            po = extract_po_with_ai(file_bytes, uploaded_file.name, uploaded_file.type)
-            results.append({
-                "po": po.model_dump(), "source": "ai",
-                "document": {"bytes": file_bytes, "filename": uploaded_file.name,
-                             "mime_type": uploaded_file.type},
-                "status": "needs review",
-            })
-        except Exception as exc:
-            failures.append(
-                f"{uploaded_file.name}: {format_extraction_error(exc)}"
-            )
-    progress.empty()
-    if failures:
-        st.error("Some documents could not be extracted:\n\n- " + "\n- ".join(failures))
-    if duplicate_files:
-        st.warning("Exact duplicate files were skipped:\n\n- " + "\n- ".join(duplicate_files))
-    if results:
-        possible_duplicates = classify_batch_duplicates(results)
-        st.session_state.extraction_queue = results
-        st.session_state.extraction_batch_id = st.session_state.get("extraction_batch_id", 0) + 1
-        activate_queued_result(0)
-        st.session_state.po_wizard_stage = "review"
-        st.session_state.extraction_notice = {
-            "extracted": len(results),
-            "uploaded": len(uploaded_files),
-            "possible_duplicates": possible_duplicates,
-            "skipped_files": duplicate_files,
-            "failures": failures,
-        }
-        st.rerun()
 
 
 def render_dashboard() -> None:
@@ -1060,6 +1162,7 @@ def render_dashboard() -> None:
         unsafe_allow_html=True,
     )
     orders = load_orders()
+    all_line_items = load_all_po_line_items()
     inventory = load_inventory()
     stored_order_label = "PO" if len(orders) == 1 else "POs"
     st.markdown(
@@ -1071,6 +1174,19 @@ def render_dashboard() -> None:
         </div>
         """,
         unsafe_allow_html=True,
+    )
+    st.download_button(
+        "Download all saved POs as Excel",
+        data=all_pos_excel_bytes(orders, all_line_items) if not orders.empty else b"",
+        file_name=f"busybee-all-purchase-orders-{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=orders.empty,
+        help=(
+            "Downloads every saved PO and all associated line items in one Excel workbook."
+            if not orders.empty
+            else "Save a purchase order before downloading the workbook."
+        ),
+        use_container_width=True,
     )
     if orders.empty:
         st.markdown(
@@ -1534,32 +1650,6 @@ def main() -> None:
         }
         .queue-bar strong { font-size: 1.05rem; }
         .queue-bar span { color: #d5d5cc; }
-        .bulk-upload-guide {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 10px;
-            margin: 0 0 18px;
-        }
-        .bulk-upload-guide div {
-            padding: 13px 14px;
-            color: #090908;
-            background: #ffffff;
-            border: 2px solid #090908;
-            box-shadow: 3px 3px 0 #ffcb28;
-            font-weight: 800;
-        }
-        .bulk-upload-guide span {
-            display: inline-grid;
-            place-items: center;
-            width: 24px;
-            height: 24px;
-            margin-right: 7px;
-            color: #090908;
-            background: #ffcb28;
-            border-radius: 50%;
-            font-size: 0.8rem;
-            font-weight: 950;
-        }
         .validation-summary {
             margin: 8px 0 14px;
             padding: 16px 18px;
@@ -1625,7 +1715,6 @@ def main() -> None:
             .hero-grid { grid-template-columns: 1fr; }
             .hero .tagline { font-size: 1.08rem; }
             .workflow-steps { grid-template-columns: repeat(2, 1fr); }
-            .bulk-upload-guide { grid-template-columns: 1fr; }
             .st-key-review_workspace [data-testid="stColumn"]:first-child {
                 position: static;
             }
@@ -1659,6 +1748,24 @@ def main() -> None:
         st.success(st.session_state.pop("save_message"))
     st.divider()
     wizard_stage = st.session_state.get("po_wizard_stage", "upload")
+    if wizard_stage == "complete":
+        workflow_steps(4)
+        st.markdown(
+            """
+            <div class="section-heading">
+                <span class="eyebrow">STEP 3 · COMPLETE</span>
+                <h2>Purchase order saved</h2>
+                <p>The PO and its inventory quantities are now included in the dashboard and Excel export.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.button(
+            "Upload another purchase order",
+            type="primary",
+            on_click=reset_po_workflow,
+        )
+        return
     if wizard_stage == "upload" or "extracted_po" not in st.session_state:
         st.session_state.po_wizard_stage = "upload"
         render_po_upload_step()
@@ -1668,8 +1775,8 @@ def main() -> None:
         """
         <div class="section-heading">
             <span class="eyebrow">STEP 2 · REVIEW</span>
-            <h2>Review extracted purchase orders</h2>
-            <p>Work through one PO at a time. The upload step stays hidden while you review.</p>
+            <h2>Review the purchase order</h2>
+            <p>Compare the extraction with the uploaded PO, then validate and save it.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1677,8 +1784,7 @@ def main() -> None:
     extraction_notice = st.session_state.pop("extraction_notice", None)
     if extraction_notice:
         st.success(
-            f"Extracted {extraction_notice['extracted']} of "
-            f"{extraction_notice['uploaded']} uploaded documents."
+            "Purchase order extracted successfully."
         )
         if extraction_notice["possible_duplicates"]:
             st.warning(
@@ -1700,32 +1806,26 @@ def main() -> None:
         st.session_state.po_wizard_stage = "upload"
         for key in (
             "extracted_po", "line_items", "source_document", "extraction_queue",
-            "po_bulk_uploader",
+            "po_uploader",
         ):
             st.session_state.pop(key, None)
         st.rerun()
 
     queue = st.session_state.get("extraction_queue", [])
     if queue:
-        active_index = st.session_state.get("active_result_index", 0)
-        selected_index = st.selectbox(
-            "Review queue",
-            options=list(range(len(queue))),
-            index=active_index,
-            format_func=lambda index: (
-                f"{index + 1}. "
-                f"{queue[index]['document']['filename'] if queue[index]['document'] else 'Synthetic sample'} "
-                f"— {queue[index]['status']}"
-            ),
-            key=f"queue_selector_{st.session_state.get('extraction_batch_id', 0)}",
-        )
-        if selected_index != active_index:
-            activate_queued_result(selected_index)
+        # Discard any legacy multi-file queue left in browser session state.
+        if len(queue) > 1:
+            legacy_index = min(st.session_state.get("active_result_index", 0), len(queue) - 1)
+            queue = [queue[legacy_index]]
+            st.session_state.extraction_queue = queue
+            activate_queued_result(0)
+        selected_index = 0
+        filename = queue[0]["document"]["filename"] if queue[0]["document"] else "Synthetic sample"
         st.markdown(
             f"""
             <div class="queue-bar">
-                <strong>Reviewing {selected_index + 1} of {len(queue)}</strong>
-                <span>{sum(item['status'] == 'saved' for item in queue)} saved · {sum(item['status'] != 'saved' for item in queue)} remaining</span>
+                <strong>{html.escape(filename)}</strong>
+                <span>{queue[0]['status']}</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1751,7 +1851,8 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     review_workspace = st.container(key="review_workspace")
-    source_panel, review_panel = review_workspace.columns([1, 1.15], gap="large")
+    review_slot = review_workspace.empty()
+    source_panel, review_panel = review_slot.columns([1, 1.15], gap="large")
 
     with source_panel:
         st.markdown('<div class="review-label">01 · SOURCE DOCUMENT</div>', unsafe_allow_html=True)
@@ -1866,7 +1967,12 @@ def main() -> None:
             "order_total": order_total,
         }
 
-        existing_order = find_order_by_number(po_number)
+        current_queue = st.session_state.get("extraction_queue", [])
+        current_queue_item = current_queue[
+            st.session_state.get("active_result_index", 0)
+        ] if current_queue else None
+        already_saved = bool(current_queue_item and current_queue_item["status"] == "saved")
+        existing_order = None if already_saved else find_order_by_number(po_number)
         active_queue_index = st.session_state.get("active_result_index", 0)
         earlier_batch_matches = [
             item
@@ -1900,6 +2006,8 @@ def main() -> None:
                 key=f"{widget_key}_duplicate_verified",
                 help="Replacing prevents the same PO from being counted twice in inventory.",
             )
+        elif already_saved:
+            st.success("This PO has been saved. Choose another item in the queue to continue.")
 
         st.subheader("Extracted line items")
         edited_items = st.data_editor(
@@ -1942,10 +2050,14 @@ def main() -> None:
 
         save_column, download_column = st.columns(2)
         with save_column:
-            if st.button(
+            source_document = st.session_state.get("source_document")
+            source_filename = (
+                source_document["filename"] if source_document else "Synthetic sample"
+            )
+            st.button(
                 "Replace with verified PO" if existing_order and duplicate_verified else "Save approved PO",
                 type="primary",
-                disabled=bool(warnings) or (duplicate_detected and not duplicate_verified),
+                disabled=already_saved or bool(warnings) or (duplicate_detected and not duplicate_verified),
                 help=(
                     "Verify the possible duplicate before saving."
                     if duplicate_detected and not duplicate_verified
@@ -1955,31 +2067,16 @@ def main() -> None:
                 ),
                 use_container_width=True,
                 key=f"{widget_key}_save",
-            ):
-                source_document = st.session_state.get("source_document")
-                source_filename = (
-                    source_document["filename"] if source_document else "Synthetic sample"
-                )
-                try:
-                    save_approved_po(
-                        summary,
-                        edited_items,
-                        source_filename,
-                        replace_existing=existing_order is not None and duplicate_verified,
-                    )
-                    queue = st.session_state.get("extraction_queue", [])
-                    if queue:
-                        queue[st.session_state.get("active_result_index", 0)]["status"] = "saved"
-                    st.session_state.save_message = (
-                        f"PO {po_number} was {'verified and replaced' if existing_order else 'saved'} "
-                        "and inventory was updated."
-                    )
-                    st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error(
-                        "That PO number is already saved. Delete the existing record first "
-                        "or use a different PO number."
-                    )
+                on_click=save_reviewed_po,
+                args=(
+                    summary,
+                    edited_items,
+                    source_filename,
+                    existing_order is not None and duplicate_verified,
+                ),
+            )
+            if st.session_state.get("po_save_error"):
+                st.error(st.session_state.po_save_error)
         with download_column:
             st.download_button(
                 "Approve & Download CSV",
