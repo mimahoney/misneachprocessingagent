@@ -38,14 +38,15 @@ streamlit run app.py
 
 ## What works
 
-- PDF, PNG, JPG, and JPEG upload
+- Single or bulk PDF, PNG, JPG, and JPEG upload with a per-document review queue
 - Vision-based PO extraction into a strict, validated schema
 - Side-by-side, in-app preview of the original PDF or image and the editable extracted data
 - Editable PO summary and line-item table
+- Styled extract → review → validate → save workflow with per-document status
 - Checks for missing identifiers, dates, invalid quantities/prices, and total mismatches
 - Separate subtotal, shipping, tax, other-charge, and discount fields so grand totals reconcile correctly
 - Local SQLite history for approved POs and line items (uploaded source files are not stored)
-- A weekly dashboard for order value, tax, shipping, PO count, and estimated time saved
+- A weekly dashboard for order value, tax, shipping, PO count, estimated time saved, and estimated labor savings at a clearly disclosed $20/hour data-entry rate
 - Saved-order history with deletion controls
 - Currency comparisons with a small tolerance for floating-point rounding
 - Excel-ready CSV download with PO fields repeated on each line-item row
