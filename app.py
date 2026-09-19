@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import html
 import json
 import os
 import sqlite3
@@ -14,6 +16,7 @@ import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from streamlit.errors import StreamlitAPIException
 
 
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -83,17 +86,143 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS receipt_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 receipt_id INTEGER NOT NULL,
+                sku TEXT,
                 description TEXT,
                 quantity REAL,
+                unit_price REAL,
                 amount REAL,
                 FOREIGN KEY (receipt_id) REFERENCES receipts(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS inventory_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_type TEXT NOT NULL CHECK (document_type IN ('purchase_order', 'receipt')),
+                document_id INTEGER NOT NULL,
+                document_number TEXT,
+                movement_date TEXT,
+                sku TEXT,
+                description TEXT,
+                quantity_change REAL NOT NULL,
+                unit_cost REAL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_sku
+            ON inventory_movements(sku);
+            """
+        )
+        receipt_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(receipt_items)")
+        }
+        if "sku" not in receipt_columns:
+            connection.execute("ALTER TABLE receipt_items ADD COLUMN sku TEXT")
+        if "unit_price" not in receipt_columns:
+            connection.execute("ALTER TABLE receipt_items ADD COLUMN unit_price REAL")
+        connection.execute(
+            """
+            INSERT INTO inventory_movements (
+                document_type, document_id, document_number, movement_date, sku,
+                description, quantity_change, unit_cost, created_at
+            )
+            SELECT 'purchase_order', po.id, po.po_number, po.order_date, li.sku,
+                   li.description, -COALESCE(li.quantity, 0), li.unit_price, po.created_at
+            FROM line_items li
+            JOIN purchase_orders po ON po.id = li.purchase_order_id
+            WHERE COALESCE(li.quantity, 0) <> 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM inventory_movements im
+                  WHERE im.document_type = 'purchase_order' AND im.document_id = po.id
+              )
+            """
+        )
+        # Purchase orders are the inventory source in the current PO-only workflow.
+        # This also corrects movements created by earlier versions that treated POs as outgoing.
+        connection.execute(
+            """
+            UPDATE inventory_movements
+            SET quantity_change = ABS(quantity_change)
+            WHERE document_type = 'purchase_order' AND quantity_change < 0
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO inventory_movements (
+                document_type, document_id, document_number, movement_date, sku,
+                description, quantity_change, unit_cost, created_at
+            )
+            SELECT 'receipt', r.id, r.merchant, r.receipt_date, ri.sku,
+                   ri.description, COALESCE(ri.quantity, 0), ri.unit_price, r.created_at
+            FROM receipt_items ri
+            JOIN receipts r ON r.id = ri.receipt_id
+            WHERE COALESCE(ri.quantity, 0) <> 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM inventory_movements im
+                  WHERE im.document_type = 'receipt' AND im.document_id = r.id
+              )
             """
         )
 
 
-def save_approved_po(summary: dict, items: pd.DataFrame, source_filename: str) -> None:
+def find_order_by_number(po_number: str) -> Optional[sqlite3.Row]:
+    normalized = po_number.strip()
+    if not normalized:
+        return None
     with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT id, po_number, buyer, order_date, order_total, source_filename, created_at
+            FROM purchase_orders
+            WHERE UPPER(TRIM(po_number)) = UPPER(?)
+            LIMIT 1
+            """,
+            (normalized,),
+        ).fetchone()
+
+
+def classify_batch_duplicates(results: list[dict]) -> int:
+    """Mark saved-number and within-batch duplicates before review begins."""
+    seen_numbers: dict[str, str] = {}
+    duplicate_count = 0
+    for result in results:
+        po_number = (result.get("po", {}).get("po_number") or "").strip()
+        normalized = po_number.casefold()
+        reasons: list[str] = []
+        saved_order = find_order_by_number(po_number) if po_number else None
+        if saved_order is not None:
+            reasons.append(
+                f"matches saved PO {saved_order['po_number']} from {saved_order['buyer']}"
+            )
+        if normalized and normalized in seen_numbers:
+            reasons.append(f"matches earlier batch file {seen_numbers[normalized]}")
+        if normalized and normalized not in seen_numbers:
+            document = result.get("document") or {}
+            seen_numbers[normalized] = document.get("filename", "an earlier upload")
+        result["duplicate_reasons"] = reasons
+        if reasons:
+            result["status"] = "duplicate — verify"
+            duplicate_count += 1
+    return duplicate_count
+
+
+def save_approved_po(
+    summary: dict,
+    items: pd.DataFrame,
+    source_filename: str,
+    replace_existing: bool = False,
+) -> None:
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT id FROM purchase_orders WHERE UPPER(TRIM(po_number)) = UPPER(?) LIMIT 1",
+            (summary["po_number"].strip(),),
+        ).fetchone()
+        if existing and not replace_existing:
+            raise sqlite3.IntegrityError("duplicate PO number")
+        if existing and replace_existing:
+            connection.execute(
+                "DELETE FROM inventory_movements WHERE document_type = 'purchase_order' AND document_id = ?",
+                (existing["id"],),
+            )
+            connection.execute("DELETE FROM purchase_orders WHERE id = ?", (existing["id"],))
         cursor = connection.execute(
             """
             INSERT INTO purchase_orders (
@@ -135,6 +264,25 @@ def save_approved_po(summary: dict, items: pd.DataFrame, source_filename: str) -
                 for _, row in items.iterrows()
             ],
         )
+        connection.executemany(
+            """
+            INSERT INTO inventory_movements (
+                document_type, document_id, document_number, movement_date, sku,
+                description, quantity_change, unit_cost
+            ) VALUES ('purchase_order', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    order_id, summary["po_number"].strip(), summary["order_date"] or None,
+                    str(row.get("SKU") or "").strip() or None,
+                    str(row.get("Description") or "").strip() or None,
+                    as_number(row.get("Quantity")) or 0.0,
+                    as_number(row.get("Unit Price")),
+                )
+                for _, row in items.iterrows()
+                if (as_number(row.get("Quantity")) or 0.0) != 0
+            ],
+        )
 
 
 def load_orders() -> pd.DataFrame:
@@ -156,6 +304,10 @@ def load_orders() -> pd.DataFrame:
 
 def delete_order(order_id: int) -> None:
     with get_connection() as connection:
+        connection.execute(
+            "DELETE FROM inventory_movements WHERE document_type = 'purchase_order' AND document_id = ?",
+            (order_id,),
+        )
         connection.execute("DELETE FROM purchase_orders WHERE id = ?", (order_id,))
 
 
@@ -178,9 +330,29 @@ def save_receipt(receipt: dict, items: pd.DataFrame, source_filename: str) -> No
         )
         receipt_id = cursor.lastrowid
         connection.executemany(
-            "INSERT INTO receipt_items (receipt_id, description, quantity, amount) VALUES (?, ?, ?, ?)",
-            [(receipt_id, str(row.get("Description") or ""), as_number(row.get("Quantity")),
+            "INSERT INTO receipt_items (receipt_id, sku, description, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)",
+            [(receipt_id, str(row.get("SKU") or ""), str(row.get("Description") or ""),
+              as_number(row.get("Quantity")), as_number(row.get("Unit Price")),
               as_number(row.get("Amount"))) for _, row in items.iterrows()],
+        )
+        connection.executemany(
+            """
+            INSERT INTO inventory_movements (
+                document_type, document_id, document_number, movement_date, sku,
+                description, quantity_change, unit_cost
+            ) VALUES ('receipt', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    receipt_id, receipt["merchant"].strip(), receipt["receipt_date"] or None,
+                    str(row.get("SKU") or "").strip() or None,
+                    str(row.get("Description") or "").strip() or None,
+                    as_number(row.get("Quantity")) or 0.0,
+                    as_number(row.get("Unit Price")),
+                )
+                for _, row in items.iterrows()
+                if (as_number(row.get("Quantity")) or 0.0) != 0
+            ],
         )
 
 
@@ -196,7 +368,34 @@ def load_receipts() -> pd.DataFrame:
 
 def delete_receipt(receipt_id: int) -> None:
     with get_connection() as connection:
+        connection.execute(
+            "DELETE FROM inventory_movements WHERE document_type = 'receipt' AND document_id = ?",
+            (receipt_id,),
+        )
         connection.execute("DELETE FROM receipts WHERE id = ?", (receipt_id,))
+
+
+def load_inventory() -> pd.DataFrame:
+    """Return inventory received from saved purchase orders."""
+    with get_connection() as connection:
+        return pd.read_sql_query(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(sku), ''), 'NO-SKU') AS sku,
+                MAX(COALESCE(NULLIF(TRIM(description), ''), 'Unlabeled item')) AS description,
+                SUM(quantity_change) AS ordered,
+                SUM(quantity_change) AS on_hand,
+                MAX(created_at) AS last_updated
+            FROM inventory_movements
+            WHERE document_type = 'purchase_order'
+            GROUP BY COALESCE(
+                NULLIF(UPPER(TRIM(sku)), ''),
+                'DESCRIPTION:' || UPPER(COALESCE(NULLIF(TRIM(description), ''), 'UNLABELED ITEM'))
+            )
+            ORDER BY on_hand ASC, sku ASC
+            """,
+            connection,
+        )
 
 
 class LineItem(BaseModel):
@@ -243,8 +442,10 @@ class PurchaseOrder(BaseModel):
 
 class ReceiptItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    sku: Optional[str] = None
     description: Optional[str] = None
     quantity: Optional[float] = None
+    unit_price: Optional[float] = None
     amount: Optional[float] = None
 
 
@@ -378,7 +579,8 @@ def extract_receipt_with_ai(
     prompt = (
         "Extract this business expense receipt. Use null for missing values and do not guess. "
         "Dates must be YYYY-MM-DD and currency a three-letter code. Categorize it as exactly one "
-        f"of: {', '.join(EXPENSE_CATEGORIES)}. Amount is the full amount for each receipt item. "
+        f"of: {', '.join(EXPENSE_CATEGORIES)}. Extract every purchased item, including its SKU "
+        "or product code, quantity, unit price, and full line amount when shown. "
         "Return only data matching the schema, without markdown fences."
     )
     response = OpenAI(api_key=api_key).responses.parse(
@@ -525,7 +727,13 @@ def render_document_preview(document: dict) -> None:
 
     st.caption(filename)
     if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
-        st.pdf(file_bytes, height=900, key=f"pdf-preview-{filename}")
+        try:
+            st.pdf(file_bytes, height=900, key=f"pdf-preview-{filename}")
+        except StreamlitAPIException:
+            st.info(
+                "PDF preview is unavailable in this environment. "
+                "Download the original below to review it."
+            )
         st.download_button(
             "Download original PDF",
             data=file_bytes,
@@ -645,10 +853,11 @@ def render_receipt_workflow() -> None:
         payment_method = st.text_input(
             "Payment method", receipt.get("payment_method") or "", key=f"{key}_payment"
         )
-        item_rows = [{"Description": item.get("description") or "", "Quantity": item.get("quantity"),
+        item_rows = [{"SKU": item.get("sku") or "", "Description": item.get("description") or "",
+                      "Quantity": item.get("quantity"), "Unit Price": item.get("unit_price"),
                       "Amount": item.get("amount")} for item in receipt.get("items", [])]
         items = st.data_editor(
-            pd.DataFrame(item_rows, columns=["Description", "Quantity", "Amount"]),
+            pd.DataFrame(item_rows, columns=["SKU", "Description", "Quantity", "Unit Price", "Amount"]),
             num_rows="dynamic", hide_index=True, use_container_width=True, key=f"{key}_items",
         )
         warnings = []
@@ -681,6 +890,128 @@ def format_money(value: float, currency: Optional[str]) -> str:
     return f"{symbol}{value:,.2f}{suffix}"
 
 
+def render_po_upload_step() -> None:
+    """Render only the upload/extraction stage of the PO wizard."""
+    st.markdown(
+        """
+        <div class="section-heading">
+            <span class="eyebrow">STEP 1 · BULK UPLOAD</span>
+            <h2>Add purchase orders</h2>
+            <p>Drop one PO or a batch. Every file is extracted automatically in upload order.</p>
+        </div>
+        <div class="bulk-upload-guide">
+            <div><span>1</span>Drop multiple POs</div>
+            <div><span>2</span>Extract the full batch</div>
+            <div><span>3</span>Review one at a time</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    workflow_steps(1)
+    uploaded_files = st.file_uploader(
+        "Drag and drop purchase orders here",
+        type=SUPPORTED_TYPES,
+        accept_multiple_files=True,
+        key="po_bulk_uploader",
+        help="Add multiple PDF, PNG, JPG, or JPEG purchase orders.",
+    )
+    if uploaded_files:
+        total_bytes = sum(uploaded.size for uploaded in uploaded_files)
+        st.markdown(
+            f'<div class="queue-bar"><strong>{len(uploaded_files)} PO'
+            f"{'s' if len(uploaded_files) != 1 else ''} ready to process</strong>"
+            f'<span>{total_bytes / (1024 * 1024):.1f} MB total · processed in upload order</span></div>',
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {"Queue": index, "File": uploaded.name, "Status": "Waiting"}
+                for index, uploaded in enumerate(uploaded_files, start=1)
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    use_sample = st.checkbox(
+        "Use synthetic sample",
+        help="Loads clearly labeled synthetic data and does not call the AI API.",
+    )
+    extract_label = (
+        f"Extract all {len(uploaded_files)} purchase orders"
+        if len(uploaded_files) > 1 else "Extract purchase order"
+    )
+    if not st.button(extract_label, type="primary"):
+        return
+    if use_sample:
+        sample_results = [{
+            "po": SYNTHETIC_SAMPLE, "source": "synthetic", "document": None,
+            "status": "needs review",
+        }]
+        possible_duplicates = classify_batch_duplicates(sample_results)
+        st.session_state.extraction_queue = sample_results
+        st.session_state.extraction_batch_id = st.session_state.get("extraction_batch_id", 0) + 1
+        activate_queued_result(0)
+        st.session_state.extraction_notice = {
+            "extracted": 1, "uploaded": 1,
+            "possible_duplicates": possible_duplicates,
+            "skipped_files": [], "failures": [],
+        }
+        st.session_state.po_wizard_stage = "review"
+        st.rerun()
+    if not uploaded_files:
+        st.warning("Upload one or more PDFs or images, or select “Use synthetic sample.”")
+        return
+
+    results, failures, duplicate_files = [], [], []
+    seen_file_hashes: dict[str, str] = {}
+    progress = st.progress(0, text="Starting batch extraction…")
+    for position, uploaded_file in enumerate(uploaded_files, start=1):
+        progress.progress(
+            (position - 1) / len(uploaded_files),
+            text=f"Extracting {uploaded_file.name} ({position} of {len(uploaded_files)})…",
+        )
+        try:
+            file_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            if file_hash in seen_file_hashes:
+                duplicate_files.append(
+                    f"{uploaded_file.name} (same file as {seen_file_hashes[file_hash]})"
+                )
+                continue
+            seen_file_hashes[file_hash] = uploaded_file.name
+            po = extract_po_with_ai(file_bytes, uploaded_file.name, uploaded_file.type)
+            results.append({
+                "po": po.model_dump(), "source": "ai",
+                "document": {"bytes": file_bytes, "filename": uploaded_file.name,
+                             "mime_type": uploaded_file.type},
+                "status": "needs review",
+            })
+        except RuntimeError as exc:
+            failures.append(f"{uploaded_file.name}: {exc}")
+        except (ValidationError, json.JSONDecodeError, ValueError):
+            failures.append(f"{uploaded_file.name}: AI response was not valid PO data.")
+        except Exception:
+            failures.append(f"{uploaded_file.name}: extraction failed; please retry.")
+    progress.empty()
+    if failures:
+        st.error("Some documents could not be extracted:\n\n- " + "\n- ".join(failures))
+    if duplicate_files:
+        st.warning("Exact duplicate files were skipped:\n\n- " + "\n- ".join(duplicate_files))
+    if results:
+        possible_duplicates = classify_batch_duplicates(results)
+        st.session_state.extraction_queue = results
+        st.session_state.extraction_batch_id = st.session_state.get("extraction_batch_id", 0) + 1
+        activate_queued_result(0)
+        st.session_state.po_wizard_stage = "review"
+        st.session_state.extraction_notice = {
+            "extracted": len(results),
+            "uploaded": len(uploaded_files),
+            "possible_duplicates": possible_duplicates,
+            "skipped_files": duplicate_files,
+            "failures": failures,
+        }
+        st.rerun()
+
+
 def render_dashboard() -> None:
     st.markdown(
         """
@@ -693,14 +1024,14 @@ def render_dashboard() -> None:
         unsafe_allow_html=True,
     )
     orders = load_orders()
-    receipts = load_receipts()
+    inventory = load_inventory()
     stored_order_label = "PO" if len(orders) == 1 else "POs"
     st.markdown(
         f"""
         <div class="database-status">
             <span class="status-dot"></span>
             <strong>SQLite connected</strong>
-            <span>{len(orders)} {stored_order_label} · {len(receipts)} receipts stored locally</span>
+            <span>{len(orders)} {stored_order_label} stored locally</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -768,6 +1099,38 @@ def render_dashboard() -> None:
             "shown without a currency symbol; no exchange-rate conversion is applied."
         )
 
+    st.markdown(
+        """
+        <div class="section-heading">
+            <span class="eyebrow">INVENTORY</span>
+            <h2>Inventory position</h2>
+            <p>Every saved purchase order adds its item quantities to inventory.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if inventory.empty:
+        st.info("No inventory yet. Save a purchase order to add its item quantities.")
+    else:
+        inventory_metrics = st.columns(3)
+        total_units = float(inventory["on_hand"].sum())
+        inventory_metrics[0].metric("Units from POs", f"{total_units:,.2f}")
+        inventory_metrics[1].metric("Products tracked", f"{len(inventory):,}")
+        inventory_metrics[2].metric("Units on hand", f"{total_units:,.2f}")
+        inventory_display = inventory.rename(
+            columns={"sku": "SKU", "description": "Item", "ordered": "From POs",
+                     "on_hand": "On Hand", "last_updated": "Updated"}
+        )
+        st.dataframe(
+            inventory_display[["SKU", "Item", "From POs", "On Hand", "Updated"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "From POs": st.column_config.NumberColumn(format="%.2f"),
+                "On Hand": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
     with st.expander("Saved purchase orders", expanded=True):
         display = orders.rename(
             columns={
@@ -821,54 +1184,6 @@ def render_dashboard() -> None:
             st.success("The selected PO and its line items were deleted.")
             st.rerun()
 
-    st.markdown(
-        """
-        <div class="section-heading">
-            <span class="eyebrow">EXPENSES</span>
-            <h2>Receipt spending</h2>
-            <p>Approved expenses grouped automatically for this week.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if receipts.empty:
-        st.info("No saved receipts yet. Choose Expense receipts below to add one.")
-    else:
-        receipt_created = pd.to_datetime(receipts["created_at"], errors="coerce")
-        weekly_receipts = receipts.loc[receipt_created >= week_start].copy()
-        receipt_currency_values = weekly_receipts["currency"].dropna().unique().tolist()
-        receipt_currency = receipt_currency_values[0] if len(receipt_currency_values) == 1 else None
-        expense_columns = st.columns(3)
-        expense_columns[0].metric("Receipts this week", f"{len(weekly_receipts):,}")
-        expense_columns[1].metric(
-            "Weekly expenses",
-            format_money(float(weekly_receipts["total"].fillna(0).sum()), receipt_currency),
-        )
-        expense_columns[2].metric(
-            "Receipt tax",
-            format_money(float(weekly_receipts["tax"].fillna(0).sum()), receipt_currency),
-        )
-        category_totals = (
-            weekly_receipts.groupby("category", as_index=False)["total"].sum()
-            .sort_values("total", ascending=False)
-            .rename(columns={"category": "Category", "total": "Total"})
-        )
-        st.dataframe(category_totals, use_container_width=True, hide_index=True)
-        with st.expander("Saved expense receipts", expanded=False):
-            st.dataframe(
-                receipts[["merchant", "receipt_date", "category", "currency", "tax", "total", "created_at"]]
-                .rename(columns={"merchant": "Merchant", "receipt_date": "Date", "category": "Category",
-                                 "currency": "Currency", "tax": "Tax", "total": "Total", "created_at": "Added"}),
-                use_container_width=True, hide_index=True,
-            )
-            receipt_id = st.selectbox(
-                "Select a receipt to delete",
-                receipts["id"].astype(int).tolist(),
-                format_func=lambda value: f"{receipts.loc[receipts['id'] == value, 'merchant'].iloc[0]} — {receipts.loc[receipts['id'] == value, 'total'].iloc[0]:.2f}",
-            )
-            if st.button("Delete selected receipt", type="secondary"):
-                delete_receipt(int(receipt_id))
-                st.rerun()
 
 
 def main() -> None:
@@ -1183,6 +1498,32 @@ def main() -> None:
         }
         .queue-bar strong { font-size: 1.05rem; }
         .queue-bar span { color: #d5d5cc; }
+        .bulk-upload-guide {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 0 0 18px;
+        }
+        .bulk-upload-guide div {
+            padding: 13px 14px;
+            color: #090908;
+            background: #ffffff;
+            border: 2px solid #090908;
+            box-shadow: 3px 3px 0 #ffcb28;
+            font-weight: 800;
+        }
+        .bulk-upload-guide span {
+            display: inline-grid;
+            place-items: center;
+            width: 24px;
+            height: 24px;
+            margin-right: 7px;
+            color: #090908;
+            background: #ffcb28;
+            border-radius: 50%;
+            font-size: 0.8rem;
+            font-weight: 950;
+        }
         .validation-summary {
             margin: 8px 0 14px;
             padding: 16px 18px;
@@ -1190,7 +1531,13 @@ def main() -> None:
             box-shadow: 4px 4px 0 #090908;
         }
         .validation-summary.pass { background: #ffcb28; }
-        .validation-summary.warning { background: #ffffff; border-left: 10px solid #ffcb28; }
+        .validation-summary.warning {
+            color: #090908 !important;
+            background: #ffcb28;
+            border-left: 10px solid #090908;
+        }
+        .validation-summary.warning strong,
+        .validation-summary.warning p { color: #090908 !important; }
         .validation-summary strong { display: block; font-size: 1.1rem; }
         .validation-summary p { margin: 3px 0 0; color: #4e4e47 !important; }
         div.stButton > button, div.stDownloadButton > button {
@@ -1242,6 +1589,7 @@ def main() -> None:
             .hero-grid { grid-template-columns: 1fr; }
             .hero .tagline { font-size: 1.08rem; }
             .workflow-steps { grid-template-columns: repeat(2, 1fr); }
+            .bulk-upload-guide { grid-template-columns: 1fr; }
             .st-key-review_workspace [data-testid="stColumn"]:first-child {
                 position: static;
             }
@@ -1274,95 +1622,52 @@ def main() -> None:
     if st.session_state.get("save_message"):
         st.success(st.session_state.pop("save_message"))
     st.divider()
+    wizard_stage = st.session_state.get("po_wizard_stage", "upload")
+    if wizard_stage == "upload" or "extracted_po" not in st.session_state:
+        st.session_state.po_wizard_stage = "upload"
+        render_po_upload_step()
+        return
+
     st.markdown(
         """
         <div class="section-heading">
-            <span class="eyebrow">NEW PURCHASE ORDER</span>
-            <h2>Process a purchase order</h2>
-            <p>Upload a document, review the extraction, then save it to your dashboard.</p>
+            <span class="eyebrow">STEP 2 · REVIEW</span>
+            <h2>Review extracted purchase orders</h2>
+            <p>Work through one PO at a time. The upload step stays hidden while you review.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    uploaded_files = st.file_uploader(
-        "Upload purchase orders",
-        type=SUPPORTED_TYPES,
-        accept_multiple_files=True,
-        help="Select one or more PDF, PNG, JPG, or JPEG files.",
-    )
-    use_sample = st.checkbox(
-        "Use synthetic sample",
-        help="Loads clearly labeled synthetic data and does not call the AI API.",
-    )
-
-    if st.button("Extract purchase orders", type="primary"):
-        if use_sample:
-            st.session_state.extraction_queue = [
-                {
-                    "po": SYNTHETIC_SAMPLE,
-                    "source": "synthetic",
-                    "document": None,
-                    "status": "needs review",
-                }
-            ]
-            st.session_state.extraction_batch_id = st.session_state.get(
-                "extraction_batch_id", 0
-            ) + 1
-            activate_queued_result(0)
-            st.success("Synthetic sample loaded. No document was uploaded or sent to an API.")
-        elif not uploaded_files:
-            st.warning("Upload one or more PDFs or images, or select “Use synthetic sample.”")
-        else:
-            results = []
-            failures = []
-            progress = st.progress(0, text="Starting batch extraction…")
-            for position, uploaded_file in enumerate(uploaded_files, start=1):
-                progress.progress(
-                    (position - 1) / len(uploaded_files),
-                    text=f"Extracting {uploaded_file.name} ({position} of {len(uploaded_files)})…",
-                )
-                try:
-                    file_bytes = uploaded_file.getvalue()
-                    po = extract_po_with_ai(
-                        file_bytes, uploaded_file.name, uploaded_file.type
-                    )
-                    results.append(
-                        {
-                            "po": po.model_dump(),
-                            "source": "ai",
-                            "document": {
-                            "bytes": file_bytes,
-                            "filename": uploaded_file.name,
-                            "mime_type": uploaded_file.type,
-                            },
-                            "status": "needs review",
-                        },
-                    )
-                except RuntimeError as exc:
-                    failures.append(f"{uploaded_file.name}: {exc}")
-                except (ValidationError, json.JSONDecodeError, ValueError):
-                    failures.append(f"{uploaded_file.name}: AI response was not valid PO data.")
-                except Exception:
-                    failures.append(f"{uploaded_file.name}: extraction failed; please retry.")
-            progress.empty()
-            if results:
-                st.session_state.extraction_queue = results
-                st.session_state.extraction_batch_id = st.session_state.get(
-                    "extraction_batch_id", 0
-                ) + 1
-                activate_queued_result(0)
-                st.success(
-                    f"Extracted {len(results)} of {len(uploaded_files)} documents. "
-                    "Review each PO in the queue below."
-                )
-            if failures:
-                st.error(
-                    "Some documents could not be extracted:\n\n- " + "\n- ".join(failures)
-                )
-
-    if "extracted_po" not in st.session_state:
-        return
+    extraction_notice = st.session_state.pop("extraction_notice", None)
+    if extraction_notice:
+        st.success(
+            f"Extracted {extraction_notice['extracted']} of "
+            f"{extraction_notice['uploaded']} uploaded documents."
+        )
+        if extraction_notice["possible_duplicates"]:
+            st.warning(
+                f"{extraction_notice['possible_duplicates']} possible duplicate PO(s) were "
+                "found by checking saved PO numbers and this batch. They are marked in the "
+                "queue and cannot be saved without verification."
+            )
+        if extraction_notice["skipped_files"]:
+            st.warning(
+                "Exact duplicate files skipped before processing:\n\n- "
+                + "\n- ".join(extraction_notice["skipped_files"])
+            )
+        if extraction_notice["failures"]:
+            st.error(
+                "Files that could not be extracted:\n\n- "
+                + "\n- ".join(extraction_notice["failures"])
+            )
+    if st.button("← Start a new upload", type="secondary"):
+        st.session_state.po_wizard_stage = "upload"
+        for key in (
+            "extracted_po", "line_items", "source_document", "extraction_queue",
+            "po_bulk_uploader",
+        ):
+            st.session_state.pop(key, None)
+        st.rerun()
 
     queue = st.session_state.get("extraction_queue", [])
     if queue:
@@ -1525,6 +1830,41 @@ def main() -> None:
             "order_total": order_total,
         }
 
+        existing_order = find_order_by_number(po_number)
+        active_queue_index = st.session_state.get("active_result_index", 0)
+        earlier_batch_matches = [
+            item
+            for item in st.session_state.get("extraction_queue", [])[:active_queue_index]
+            if (item.get("po", {}).get("po_number") or "").strip().casefold()
+            == po_number.strip().casefold()
+            and po_number.strip()
+        ]
+        duplicate_detected = existing_order is not None or bool(earlier_batch_matches)
+        duplicate_verified = False
+        if duplicate_detected:
+            duplicate_source = []
+            if existing_order is not None:
+                duplicate_source.append(
+                    f"saved PO from {html.escape(existing_order['buyer'])} "
+                    f"added {html.escape(existing_order['created_at'])}"
+                )
+            if earlier_batch_matches:
+                duplicate_source.append("an earlier document in this upload batch")
+            st.markdown(
+                f"""
+                <div class="validation-summary warning">
+                    <strong>Possible duplicate PO: {html.escape(po_number)}</strong>
+                    <p>This number already matches {' and '.join(duplicate_source)}. It will not be added unless you verify it below.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            duplicate_verified = st.checkbox(
+                "I compared the documents and verified this PO should be processed",
+                key=f"{widget_key}_duplicate_verified",
+                help="Replacing prevents the same PO from being counted twice in inventory.",
+            )
+
         st.subheader("Extracted line items")
         edited_items = st.data_editor(
             st.session_state.line_items,
@@ -1567,10 +1907,16 @@ def main() -> None:
         save_column, download_column = st.columns(2)
         with save_column:
             if st.button(
-                "Save approved PO",
+                "Replace with verified PO" if existing_order and duplicate_verified else "Save approved PO",
                 type="primary",
-                disabled=bool(warnings),
-                help="Resolve validation warnings before saving." if warnings else None,
+                disabled=bool(warnings) or (duplicate_detected and not duplicate_verified),
+                help=(
+                    "Verify the possible duplicate before saving."
+                    if duplicate_detected and not duplicate_verified
+                    else "Resolve validation warnings before saving."
+                    if warnings
+                    else None
+                ),
                 use_container_width=True,
                 key=f"{widget_key}_save",
             ):
@@ -1579,12 +1925,18 @@ def main() -> None:
                     source_document["filename"] if source_document else "Synthetic sample"
                 )
                 try:
-                    save_approved_po(summary, edited_items, source_filename)
+                    save_approved_po(
+                        summary,
+                        edited_items,
+                        source_filename,
+                        replace_existing=existing_order is not None and duplicate_verified,
+                    )
                     queue = st.session_state.get("extraction_queue", [])
                     if queue:
                         queue[st.session_state.get("active_result_index", 0)]["status"] = "saved"
                     st.session_state.save_message = (
-                        f"PO {po_number} was saved and added to this week's dashboard."
+                        f"PO {po_number} was {'verified and replaced' if existing_order else 'saved'} "
+                        "and inventory was updated."
                     )
                     st.rerun()
                 except sqlite3.IntegrityError:

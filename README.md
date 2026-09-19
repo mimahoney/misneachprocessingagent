@@ -1,6 +1,6 @@
 # PO Pilot
 
-PO Pilot is a small Streamlit MVP that turns retailer purchase orders into reviewed, validated, Excel-ready CSV records. Upload a PDF or image, extract structured fields with a vision-capable AI model, edit the result, resolve validation warnings, save approved data to a local dashboard, and download the line items.
+BusyBee PO Pilot turns purchase orders into reviewed, validated records. Upload PDFs or images, extract structured fields with a vision-capable AI model, edit the result, resolve validation warnings, save approved data to a local dashboard, and download PO line items.
 
 > **Privacy warning:** Do not upload confidential or sensitive company documents to this demo. Uploaded files are held only in memory by the app and are not deliberately logged or saved, but live extraction sends the document to the configured AI provider for processing. Review that provider's data policies before using real documents.
 
@@ -38,7 +38,9 @@ streamlit run app.py
 
 ## What works
 
-- Single or bulk PDF, PNG, JPG, and JPEG upload with a per-document review queue
+- Bulk drag-and-drop for PDF, PNG, JPG, and JPEG POs with automated sequential extraction and a per-document review queue
+- Guided upload-to-review wizard that displays only the current stage instead of stacking the uploader and review workspace
+- Duplicate protection that skips identical uploaded files, flags repeated PO numbers, and requires explicit verification before replacing a saved PO
 - Vision-based PO extraction into a strict, validated schema
 - Side-by-side, in-app preview of the original PDF or image and the editable extracted data
 - Editable PO summary and line-item table
@@ -48,6 +50,8 @@ streamlit run app.py
 - Local SQLite history for approved POs and line items (uploaded source files are not stored)
 - A weekly dashboard for order value, tax, shipping, PO count, estimated time saved, and estimated labor savings at a clearly disclosed $20/hour data-entry rate
 - Saved-order history with deletion controls
+- Inventory ledger populated directly from saved PO line-item quantities
+- Inventory dashboard with PO units and on-hand totals by SKU (or item description when no SKU is printed)
 - Currency comparisons with a small tolerance for floating-point rounding
 - Excel-ready CSV download with PO fields repeated on each line-item row
 - Friendly extraction errors and a retry path
@@ -57,7 +61,7 @@ streamlit run app.py
 
 The **Use synthetic sample** option bypasses the API and loads hardcoded demonstration data. The data, company, SKUs, and PO number are all synthetic. Its third line has an intentionally incorrect line total, so validation reliably shows both a line-level mismatch and a PO-total mismatch. Approval/download stays disabled until the warnings are corrected.
 
-There is no retailer integration, multi-user authentication, cloud deployment, or automatic Excel upload in this MVP. “Approve” means the reviewed structured data can be saved to the local SQLite dashboard and exported as a CSV download. Deleting a saved PO also deletes its saved line items. Uploaded PDF and image files are never stored in the database.
+There is no retailer integration, multi-user authentication, cloud deployment, or automatic Excel upload in this MVP. “Approve” means the reviewed structured data can be saved to the local SQLite dashboard and exported as a CSV download. Each saved PO adds its line-item quantities to inventory; deleting it reverses those inventory additions. Uploaded PDF and image files are never stored in the database.
 
 ## Where AI is used
 
