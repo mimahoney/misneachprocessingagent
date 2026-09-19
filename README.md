@@ -1,0 +1,68 @@
+# PO Pilot
+
+PO Pilot is a small Streamlit MVP that turns retailer purchase orders into reviewed, validated, Excel-ready CSV records. Upload a PDF or image, extract structured fields with a vision-capable AI model, edit the result, resolve validation warnings, and download the line items.
+
+> **Privacy warning:** Do not upload confidential or sensitive company documents to this demo. Uploaded files are held only in memory by the app and are not deliberately logged or saved, but live extraction sends the document to the configured AI provider for processing. Review that provider's data policies before using real documents.
+
+## Who it is for
+
+PO Pilot is built for early-stage consumer-goods founders who manually transfer retailer purchase orders into spreadsheets. It removes the repetitive first-pass copying while keeping a human review step before export.
+
+## Setup
+
+Python 3.10 or newer is recommended.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Set your OpenAI API key in the same terminal. Never put it in `app.py` or commit it to source control.
+
+```bash
+export OPENAI_API_KEY="your-api-key-here"
+```
+
+The default model is `gpt-4.1-mini`. To use another compatible vision model, set `OPENAI_MODEL`:
+
+```bash
+export OPENAI_MODEL="gpt-4.1-mini"
+```
+
+Run the app:
+
+```bash
+streamlit run app.py
+```
+
+## What works
+
+- PDF, PNG, JPG, and JPEG upload
+- Vision-based PO extraction into a strict, validated schema
+- Editable PO summary and line-item table
+- Checks for missing identifiers, dates, invalid quantities/prices, and total mismatches
+- Currency comparisons with a small tolerance for floating-point rounding
+- Excel-ready CSV download with PO fields repeated on each line-item row
+- Friendly extraction errors and a retry path
+- A no-API synthetic sample with three items and an intentional discrepancy
+
+## What is simulated
+
+The **Use synthetic sample** option bypasses the API and loads hardcoded demonstration data. The data, company, SKUs, and PO number are all synthetic. Its third line has an intentionally incorrect line total, so validation reliably shows both a line-level mismatch and a PO-total mismatch. Approval/download stays disabled until the warnings are corrected.
+
+There is no retailer integration, approval workflow, database, authentication, cloud deployment, or automatic Excel upload in this MVP. “Approve” means the reviewed rows are exported as a local CSV download.
+
+## Where AI is used
+
+AI is used only for document extraction. The uploaded document and extraction instructions are sent to a vision-capable OpenAI model, which is required to return structured data matching the `PurchaseOrder` schema. Pydantic validates that result before the UI displays it. Editing, validation rules, and CSV creation are local, deterministic application logic.
+
+## Suggested 60-second demo
+
+1. Open PO Pilot and explain the founder bottleneck in one sentence.
+2. Select **Use synthetic sample**, then click **Extract PO**.
+3. Point out the editable PO summary and three extracted line items.
+4. Show the validation warnings caused by the intentional third-line discrepancy.
+5. Change the third line total from `175.00` to `180.00`; the corrected line sum is `470.00`, clearing both warnings.
+6. Click **Approve & Download CSV** and open the downloaded CSV in Excel or another spreadsheet app.
+7. Mention that a real PDF or image follows the same flow when `OPENAI_API_KEY` is set.
